@@ -1,4 +1,4 @@
-package io.rolling.spark.ml.hs
+package io.github.diegoruotolo.spark.ml.hs
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
 

@@ -4,7 +4,7 @@ import Keys._
 lazy val root = (project in file("."))
   .settings(
     name := "helter-skelter",
-    organization := "io.rolling.spark",
+    organization := "io.github.diegoruotolo",
     version := "0.0.1-SNAPSHOT",
 
     // 1. Define the primary Scala version and the supported cross-build versions

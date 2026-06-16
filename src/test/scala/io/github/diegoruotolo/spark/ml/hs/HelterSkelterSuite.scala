@@ -1,8 +1,8 @@
-package io.rolling.spark.ml.hs
+package io.github.diegoruotolo.spark.ml.hs
 
 import com.holdenkarau.spark.testing.DataFrameSuiteBase
-import io.rolling.spark.ml.hs.HSTestData._
-import io.rolling.spark.ml.hs.HelterSkelter.DEFAULT_Z_THRESHOLD
+import HSTestData._
+import HelterSkelter.DEFAULT_Z_THRESHOLD
 import org.apache.spark.ml.PipelineModel
 import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.{DataFrame, SparkSession}

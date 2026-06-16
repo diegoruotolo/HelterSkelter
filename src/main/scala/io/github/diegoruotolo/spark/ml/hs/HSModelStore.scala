@@ -1,4 +1,4 @@
-package io.rolling.spark.ml.hs
+package io.github.diegoruotolo.spark.ml.hs
 
 import org.apache.log4j.{LogManager, Logger}
 import org.apache.spark.ml.PipelineModel

@@ -1,8 +1,8 @@
-package io.rolling.spark.ml.hs
+package io.github.diegoruotolo.spark.ml.hs
 
 import com.holdenkarau.spark.testing.DataFrameSuiteBase
-import io.rolling.spark.ml.hs.HSModelStore.{META_DIR, MODEL_DIR}
-import io.rolling.spark.ml.hs.HSTestData._
+import HSModelStore.{META_DIR, MODEL_DIR}
+import HSTestData._
 import org.apache.commons.io.FileUtils
 import org.apache.spark.ml.feature.VectorAssembler
 import org.apache.spark.ml.regression.LinearRegression
