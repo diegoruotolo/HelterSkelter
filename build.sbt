@@ -56,9 +56,6 @@ lazy val root = (project in file("."))
     Test / fork := true,
     Test / javaOptions ++= Seq(
       "-Xms1G",
-      "-Xmx4G",
-      "--add-opens=java.base/java.nio=ALL-UNNAMED",
-      "--add-opens=java.base/java.util=ALL-UNNAMED",
-      "--add-opens=java.base/java.lang=ALL-UNNAMED"
+      "-Xmx4G"
     )
   )

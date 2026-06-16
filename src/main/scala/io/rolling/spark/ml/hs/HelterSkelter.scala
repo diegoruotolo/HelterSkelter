@@ -1,109 +1,13 @@
 package io.rolling.spark.ml.hs
 
+import io.rolling.spark.ml.hs.HSModelStore.{load, store}
 import org.apache.log4j.{LogManager, Logger}
+import org.apache.spark.ml.Pipeline
 import org.apache.spark.ml.feature.VectorAssembler
 import org.apache.spark.ml.regression.LinearRegression
-import org.apache.spark.ml.{Pipeline, PipelineModel}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Column, DataFrame, SparkSession}
-
-import scala.util.{Failure, Success, Try}
-
-/**
- * Common trait for types that carry the Fourier/changepoint configuration
- * needed to compute feature column names.
- *
- * Implemented by both [[HSConfig]] (used during training) and
- * [[HSMeta]] (loaded from storage during scoring), so that
- * [[HelterSkelter.featureColNames]] can accept either one.
- */
-trait HSFeatureSpec {
-  def fourierOrderHourly: Int
-
-  def fourierOrderWeekly: Int
-
-  def fourierOrderMonthly: Int
-
-  def fourierOrderYearly: Int
-
-  def nChangepoints: Int
-}
-
-/**
- * Configuration parameters for the HelterSkelter anomaly detection model.
- *
- * @param fourierOrderHourly  number of Fourier terms for hourly seasonality (period 24h)
- * @param fourierOrderWeekly  number of Fourier terms for weekly seasonality (period 168h)
- * @param fourierOrderMonthly number of Fourier terms for monthly seasonality (period 720.5h ≈ 30.02 days)
- * @param fourierOrderYearly  number of Fourier terms for yearly seasonality (period 8766h)
- * @param nChangepoints       number of changepoints to use in the piecewise linear trend (equidistant in the training period)
- */
-case class HSConfig(
-                     fourierOrderHourly: Int = 4, // 24h cycle:    captures morning/evening peaks
-                     fourierOrderWeekly: Int = 3, // 168h cycle:   weekday vs weekend
-                     fourierOrderMonthly: Int = 5, // 720.5h cycle: monthly pattern (≈30.02 days)
-                     fourierOrderYearly: Int = 8, // 8766h cycle:  summer vs winter
-                     nChangepoints: Int = 9 // equidistant changepoints in training
-                   ) extends HSFeatureSpec {
-  require(fourierOrderHourly >= 0, s"fourierOrderHourly must be >= 0, got $fourierOrderHourly")
-  require(fourierOrderWeekly >= 0, s"fourierOrderWeekly must be >= 0, got $fourierOrderWeekly")
-  require(fourierOrderMonthly >= 0, s"fourierOrderMonthly must be >= 0, got $fourierOrderMonthly")
-  require(fourierOrderYearly >= 0, s"fourierOrderYearly must be >= 0, got $fourierOrderYearly")
-  require(nChangepoints >= 0, s"nChangepoints must be >= 0, got $nChangepoints")
-}
-
-/**
- * Metadata computed during training and reused unchanged during scoring.
- *
- * Defined at package level (not as an inner class) so that Spark's implicit
- * Encoder derivation works reliably across all Spark/Scala versions.
- *
- * @param minTs               timestamp of the first training record, in HOURS from Unix epoch.
- *                            Serves as "zero" to normalize trend.
- * @param rangeTs             total duration of the training set in HOURS.
- *                            Used to normalize trend in [0,1] and to scale changepoint hinges.
- * @param trainSigmas         per-metric standard deviation of residuals (observed − predicted) on the training set.
- *                            Keys are the value column names used during training; values are the corresponding sigmas.
- *                            Each sigma is the unit of measure to decide if a residual for that metric is "normal" or anomalous.
- * @param cpPositions         changepoint positions in HOURS from Unix epoch.
- *                            Must be the same in training and scoring, otherwise the hinges
- *                            would have different values and the learned weights would not match.
- *                            Stored for config-compatibility validation at scoring time.
- * @param fourierOrderHourly  Fourier order for hourly seasonality used during training.
- * @param fourierOrderWeekly  Fourier order for weekly seasonality used during training.
- * @param fourierOrderMonthly Fourier order for monthly seasonality used during training.
- * @param fourierOrderYearly  Fourier order for yearly seasonality used during training.
- */
-case class HSMeta(
-                   minTs: Double,
-                   rangeTs: Double,
-                   trainSigmas: Map[String, Double],
-                   cpPositions: Seq[Double],
-                   fourierOrderHourly: Int,
-                   fourierOrderWeekly: Int,
-                   fourierOrderMonthly: Int,
-                   fourierOrderYearly: Int
-                 ) extends HSFeatureSpec {
-  override def nChangepoints: Int = cpPositions.size
-}
-
-/**
- * Container for the trained model and its associated metadata.
- *
- * @param model trained PipelineModel containing a shared VectorAssembler followed by
- *              one LinearRegressionModel per metric (value column)
- * @param meta  HSMeta with the training configuration and parameters needed for scoring
- */
-case class HSModel(model: PipelineModel, meta: HSMeta)
-
-/**
- * Custom exception for errors related to the HelterSkelter model.
- *
- * @param message error message describing the issue
- * @param cause   optional underlying cause of the exception (e.g. from a failed model load)
- */
-class ModelException(message: String, cause: Throwable = null) extends Exception(message, cause)
 
 /**
  * Anomaly Detection for time series with multiple seasonality and multiple metrics.
@@ -139,9 +43,6 @@ object HelterSkelter {
    */
   @transient protected lazy val logger: Logger = LogManager.getLogger(getClass)
 
-  val MODEL_DIR = "/model"
-  val META_DIR = "/meta"
-
   /** Fourier period constants in hours */
   val HOURS_PER_DAY: Double = 24.0
   val HOURS_PER_WEEK: Double = 168.0
@@ -150,6 +51,9 @@ object HelterSkelter {
 
   /** Default sigma to use when training sigma cannot be computed (e.g. empty training set, perfect fit) to avoid division by zero during scoring. */
   val MIN_SIGMA = 1e-6
+
+  /** Default z-score threshold for anomaly classification (2.5 = 2.5 standard deviations from the norm) */
+  val DEFAULT_Z_THRESHOLD = 2.5
 
   // ─── PHASE 1: Batch training ──────────────────────────────────────────────────
 
@@ -172,10 +76,9 @@ object HelterSkelter {
    * @param valueCols  set of column names in `historicDf` that contain the numeric metric values to model
    *                   (e.g. Set("bookings", "searches")). Each gets its own LinearRegression stage.
    * @param config     HSConfig with Fourier/changepoint hyper-parameters
-   * @param spark      implicit SparkSession
    * @return HSModel containing the trained PipelineModel and HSMeta with training parameters and sigmas for scoring
    */
-  def train(historicDf: DataFrame, valueCols: Set[String], config: HSConfig = HSConfig())(implicit spark: SparkSession): HSModel = {
+  def fit(historicDf: DataFrame, valueCols: Set[String], config: HSConfig = HSConfig()): HSModel = {
 
     logger.info("Starting training of HelterSkelter model")
     require(valueCols != null && valueCols.nonEmpty, "valueCols must not be empty")
@@ -300,26 +203,6 @@ object HelterSkelter {
   }
 
   /**
-   * Saves the given HSModel (PipelineModel + HSMeta) to persistent storage.
-   *
-   * @param model     the HSModel containing the trained PipelineModel and HSMeta to save
-   * @param modelPath path where to save the model and metadata (e.g. "s3://my-bucket/spark-prophet")
-   * @param spark     implicit SparkSession
-   */
-  def storeModel(model: HSModel, modelPath: String)(implicit spark: SparkSession): Unit = {
-    require(model != null, "model must not be null")
-    require(model.model != null, "trained model must not be null")
-    require(model.meta != null, "metadata must not be null")
-    require(modelPath != null && modelPath.nonEmpty, "model path must not be null nor empty")
-
-    logger.info(s"Saving model to ${modelPath + MODEL_DIR}")
-    model.model.write.overwrite().save(modelPath + MODEL_DIR)
-    logger.info(s"Saving training metadata to ${modelPath + META_DIR}")
-    spark.createDataFrame(Seq(model.meta)).write.mode("overwrite").parquet(modelPath + META_DIR)
-    logger.info("Model and metadata saved successfully, ciao!")
-  }
-
-  /**
    * Convenience method to train the model and store it in one step.
    *
    * @param historicDf DataFrame with historical data for training. Must have columns:
@@ -332,55 +215,26 @@ object HelterSkelter {
    * @param spark      implicit SparkSession
    * @return HSModel containing the trained PipelineModel and HSMeta with training parameters and sigmas for scoring
    */
-  def trainAndStore(historicDf: DataFrame, modelPath: String, valueCols: Set[String], config: HSConfig = HSConfig())(implicit spark: SparkSession): HSModel = {
-    val model = train(historicDf, valueCols, config)
-    storeModel(model, modelPath)
+  def fitAndStore(historicDf: DataFrame, modelPath: String, valueCols: Set[String], config: HSConfig = HSConfig())(implicit spark: SparkSession): HSModel = {
+    val model = fit(historicDf, valueCols, config)
+    store(model, modelPath)
     model
   }
 
   // ─── PHASE 2: Scoring
 
   /**
-   * Loads the trained model and metadata from storage.
-   *
-   * @param modelPath path where the model and metadata were saved during training (e.g. "s3://my-bucket/spark-prophet")
-   * @param spark     implicit SparkSession
-   * @return HSModel containing the PipelineModel and HSMeta needed for scoring
-   */
-  def loadModel(modelPath: String)(implicit spark: SparkSession): HSModel = {
-    logger.info(s"Loading model from ${modelPath + MODEL_DIR}")
-    val model = Try(PipelineModel.load(modelPath + MODEL_DIR)) match {
-      case Success(m) => m
-      case Failure(e) => throw new ModelException(s"Failed to load model from path ${modelPath + MODEL_DIR}: ${e.getMessage}", e)
-    }
-
-    import spark.implicits._
-    logger.info(s"Loading metadata from ${modelPath + META_DIR}")
-    val meta = Try(spark.read.parquet(modelPath + META_DIR).as[HSMeta].head(1).headOption) match {
-      case Success(Some(elem)) => elem
-      case Success(None) => throw new ModelException(s"TrainMeta dataset is empty at path ${modelPath + META_DIR}")
-      case Failure(e) => throw new ModelException(s"Failed to load TrainMeta from path ${modelPath + META_DIR}: ${e.getMessage}", e)
-    }
-
-    logger.info(s"Loaded training metadata: minTs=${meta.minTs}, rangeTs=${meta.rangeTs}, trainSigmas=${meta.trainSigmas}, " +
-      s"nChangepoints=${meta.nChangepoints}, fourierOrders=[H=${meta.fourierOrderHourly}, W=${meta.fourierOrderWeekly}, " +
-      s"M=${meta.fourierOrderMonthly}, Y=${meta.fourierOrderYearly}]")
-
-    HSModel(model, meta)
-  }
-
-  /**
    * Scores a DataFrame with one or more metrics using the trained model.
    * Always uses minTs/rangeTs/cpPositions from training → features identical to the fit.
    * Never accesses historical data → no data leakage.
    *
-   * @param model          HSModel containing the trained PipelineModel and HSMeta
-   * @param df             DataFrame with new data to score. Must have columns:
+   * @param model     HSModel containing the trained PipelineModel and HSMeta
+   * @param df        DataFrame with new data to score. Must have columns:
    *                       - timestamp (TimestampType, DateType, StringType with format yyyy-MM-dd HH:mm:ss,
    *                         or LongType/IntegerType interpreted as Unix epoch seconds)
    *                       - one or more numeric metric columns whose names are listed in `valueCols`
-   * @param valueCols      set of metric column names to score (must be a subset of the columns the model was trained on)
-   * @param sigmaThreshold z-score threshold to classify anomalies (e.g. 2.5 means 2.5 standard deviations from the norm; must be > 0)
+   * @param valueCols set of metric column names to score (must be a subset of the columns the model was trained on)
+   * @param threshold z-score threshold to classify anomalies (e.g. 2.5 means 2.5 standard deviations from the norm; must be > 0)
    * @return DataFrame with all original input columns preserved, plus per-metric scoring columns
    *         prefixed with `{metricName}_`:
    *         - {metric}_forecast: predicted value from the model (rounded to 1 decimal)
@@ -393,10 +247,10 @@ object HelterSkelter {
    *         - {metric}_minForecast: forecast − sigmaThreshold * trainSigma (lower bound of "normal" range)
    *         - {metric}_maxForecast: forecast + sigmaThreshold * trainSigma (upper bound of "normal" range)
    */
-  def scoreWithModel(model: HSModel)(df: DataFrame, valueCols: Set[String], sigmaThreshold: Double = 2.5): DataFrame = {
+  def predict(model: HSModel, df: DataFrame, valueCols: Set[String], threshold: Double = DEFAULT_Z_THRESHOLD): DataFrame = {
 
     logger.info("Starting scoring with HelterSkelter model")
-    require(sigmaThreshold > 0, s"sigmaThreshold must be > 0, got $sigmaThreshold")
+    require(threshold > 0, s"sigmaThreshold must be > 0, got $threshold")
     require(valueCols != null && valueCols.nonEmpty, "valueCols must not be empty")
     validateInput(df, Set("timestamp") ++ valueCols, "score")
 
@@ -410,7 +264,7 @@ object HelterSkelter {
         s"Trained metrics: ${trainSigmas.keySet.mkString(", ")}")
 
     val featured = addFeatures(df, meta)
-    logger.info("Scoring and classifying anomalies with threshold " + sigmaThreshold)
+    logger.info("Scoring and classifying anomalies with threshold " + threshold)
 
     // All computations use the full-precision raw columns (_residual_raw, _z_score_raw);
     // rounded display columns are created at the end, and raw intermediates are dropped.
@@ -422,14 +276,14 @@ object HelterSkelter {
           when(abs(col(valueCol + "_prediction")) > MIN_SIGMA,
             round((col(valueCol) - col(valueCol + "_prediction")) / col(valueCol + "_prediction") * 100, 1))
             .otherwise(lit(null).cast(DoubleType)))
-        .withColumn(valueCol + "_is_anomaly", abs(col(valueCol + "_z_score_raw")) > sigmaThreshold)
+        .withColumn(valueCol + "_is_anomaly", abs(col(valueCol + "_z_score_raw")) > threshold)
         .withColumn(valueCol + "_severity",
-          when(abs(col(valueCol + "_z_score_raw")) > sigmaThreshold * 2.0, "HIGH")
-            .when(abs(col(valueCol + "_z_score_raw")) > sigmaThreshold * 1.5, "MEDIUM")
-            .when(abs(col(valueCol + "_z_score_raw")) > sigmaThreshold, "LOW")
+          when(abs(col(valueCol + "_z_score_raw")) > threshold * 2.0, "HIGH")
+            .when(abs(col(valueCol + "_z_score_raw")) > threshold * 1.5, "MEDIUM")
+            .when(abs(col(valueCol + "_z_score_raw")) > threshold, "LOW")
             .otherwise("OK"))
-        .withColumn(valueCol + "_minForecast", round(col(valueCol + "_prediction") - lit(sigmaThreshold * trainSigmas(valueCol)), 1))
-        .withColumn(valueCol + "_maxForecast", round(col(valueCol + "_prediction") + lit(sigmaThreshold * trainSigmas(valueCol)), 1))
+        .withColumn(valueCol + "_minForecast", round(col(valueCol + "_prediction") - lit(threshold * trainSigmas(valueCol)), 1))
+        .withColumn(valueCol + "_maxForecast", round(col(valueCol + "_prediction") + lit(threshold * trainSigmas(valueCol)), 1))
         .withColumn(valueCol + "_forecast", round(col(valueCol + "_prediction"), 1))
         .withColumn(valueCol + "_residual", round(col(valueCol + "_residual_raw"), 1))
         .withColumn(valueCol + "_z_score", round(col(valueCol + "_z_score_raw"), 2))
@@ -447,22 +301,22 @@ object HelterSkelter {
   /**
    * Convenience method to load the model and score in one step.
    *
-   * @param modelPath      path where the model and metadata were saved during training (e.g. "s3://my-bucket/spark-prophet")
-   * @param df             DataFrame with new data to score. Must have columns:
+   * @param modelPath path where the model and metadata were saved during training (e.g. "s3://my-bucket/spark-prophet")
+   * @param df        DataFrame with new data to score. Must have columns:
    *                       - timestamp (TimestampType, DateType, StringType with format yyyy-MM-dd HH:mm:ss,
    *                         or LongType/IntegerType interpreted as Unix epoch seconds)
    *                       - one or more numeric metric columns whose names are listed in `valueCols`
-   * @param valueCols      set of metric column names to score (must be a subset of the columns the model was trained on)
-   * @param sigmaThreshold z-score threshold to classify anomalies (e.g. 2.5 means 2.5 standard deviations from the norm; must be > 0)
-   * @param spark          implicit SparkSession
+   * @param valueCols set of metric column names to score (must be a subset of the columns the model was trained on)
+   * @param threshold z-score threshold to classify anomalies (e.g. 2.5 means 2.5 standard deviations from the norm; must be > 0)
+   * @param spark     implicit SparkSession
    * @return DataFrame with all original input columns preserved, plus the per-metric scoring columns described in scoreWithModel().
    * @see scoreWithModel()
    * @see loadModel()
    * @note This method is less efficient if you need to score multiple DataFrames in a row, since it loads the model from storage every time.
    *       In that case, it's better to call loadModel() once and reuse the HSModel instance for multiple scoreWithModel() calls.
    */
-  def score(modelPath: String, df: DataFrame, valueCols: Set[String], sigmaThreshold: Double = 2.5)(implicit spark: SparkSession): DataFrame =
-    scoreWithModel(loadModel(modelPath))(df, valueCols, sigmaThreshold)
+  def loadAndPredict(modelPath: String, df: DataFrame, valueCols: Set[String], threshold: Double = DEFAULT_Z_THRESHOLD)(implicit spark: SparkSession): DataFrame =
+    predict(load(modelPath), df, valueCols, threshold)
 
   // ─── Feature engineering ──────────────────────────────────────────────────────
 
@@ -494,11 +348,11 @@ object HelterSkelter {
    * angle = ts_hours / periodHours * 2πk  (pure number, no units)
    * Now everything is consistent: ts_hours / periodHours = completed cycles
    *
-   * @param df          input DataFrame; must contain a "timestamp" column of a supported type
-   *                    (TimestampType, DateType, StringType with format yyyy-MM-dd HH:mm:ss,
-   *                    or LongType/IntegerType interpreted as Unix epoch seconds).
-   *                    Any other metric columns are passed through unchanged.
-   * @param meta        Fourier/changepoint configuration (either HSConfig or HSMeta)
+   * @param df   input DataFrame; must contain a "timestamp" column of a supported type
+   *             (TimestampType, DateType, StringType with format yyyy-MM-dd HH:mm:ss,
+   *             or LongType/IntegerType interpreted as Unix epoch seconds).
+   *             Any other metric columns are passed through unchanged.
+   * @param meta Fourier/changepoint configuration (either HSConfig or HSMeta)
    * @return DataFrame with the original columns plus the added feature columns (trend, cp_*, Fourier terms)
    */
   private def addFeatures(
