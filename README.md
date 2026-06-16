@@ -50,6 +50,27 @@ Helter Skelter:
 
 ## Quick Start
 
+### Installation
+
+**sbt**
+```scala
+libraryDependencies += "io.github.diegoruotolo" %% "helter-skelter" % "0.0.1"
+```
+
+**Maven**
+```xml
+<dependency>
+    <groupId>io.github.diegoruotolo</groupId>
+    <artifactId>helter-skelter_2.12</artifactId>
+    <version>0.0.1</version>
+</dependency>
+```
+
+> For Scala 2.13 replace the artifactId suffix with `helter-skelter_2.13`.
+> Spark (`spark-core`, `spark-sql`, `spark-mllib`) is a `provided` dependency — it must be on the classpath of your application or cluster.
+
+---
+
 ### Complete End-to-End Example
 
 ```scala

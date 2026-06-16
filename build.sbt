@@ -1,11 +1,61 @@
 import sbt._
 import Keys._
+import sbtrelease.ReleaseStateTransformations._
+import sbtrelease.ReleasePlugin.autoImport._
 
 lazy val root = (project in file("."))
   .settings(
-    name := "helter-skelter",
+    name         := "helter-skelter",
     organization := "io.github.diegoruotolo",
-    version := "0.0.1-SNAPSHOT",
+
+    // ── Maven Central metadata ──────────────────────────────────────────────
+    description := "Native Scala/Spark implementation of the Prophet algorithm for time-series forecasting and anomaly detection",
+    licenses    := Seq("Apache-2.0" -> url("https://www.apache.org/licenses/LICENSE-2.0")),
+    homepage    := Some(url("https://github.com/diegoruotolo/HelterSkelter")),
+    scmInfo := Some(ScmInfo(
+      url("https://github.com/diegoruotolo/HelterSkelter"),
+      "scm:git@github.com:diegoruotolo/HelterSkelter.git"
+    )),
+    developers := List(
+      Developer(
+        id    = "diegoruotolo",
+        name  = "Diego Ruotolo",
+        email = "",
+        url   = url("https://github.com/diegoruotolo")
+      )
+    ),
+
+    // ── Sonatype / Maven Central publishing ────────────────��───────────────
+    sonatypeCredentialHost := "central.sonatype.com",
+    sonatypeRepository     := "https://central.sonatype.com/api/v1/publisher",
+    publishTo              := sonatypePublishToBundle.value,
+    publishMavenStyle      := true,
+    sonatypeTimeoutMillis := 600000,  // 10 minutes (default is ~60s)
+
+    // Do not publish test artifacts
+    Test / publishArtifact := false,
+    // Publish sources and Scaladoc jars (required by Maven Central)
+    Compile / packageSrc / publishArtifact := true,
+    Compile / packageDoc / publishArtifact := true,
+
+    // ── sbt-release configuration ──────────────────────────────────────────
+    // Cross-publish both Scala versions on release
+    releaseCrossBuild := true,
+    releaseProcess := Seq[ReleaseStep](
+      checkSnapshotDependencies,
+      inquireVersions,
+      runClean,
+      runTest,
+      setReleaseVersion,
+      commitReleaseVersion,
+      tagRelease,
+//      releaseStepCommand("sonatypeBundleClean"),
+//      releaseStepCommandAndRemaining("+publishSigned"),
+//      releaseStepCommand("sonatypeBundleRelease"),
+      setNextVersion,
+      commitNextVersion,
+      pushChanges
+    ),
 
     // 1. Define the primary Scala version and the supported cross-build versions
     scalaVersion := "2.12.19",
@@ -43,8 +93,8 @@ lazy val root = (project in file("."))
         "org.apache.spark" %% "spark-mllib" % sparkVersion % Provided,
 
         // Logging
-        "org.apache.logging.log4j" % "log4j-api" % "2.17.2",
-        "org.apache.logging.log4j" % "log4j-core" % "2.17.2",
+        "org.apache.logging.log4j" % "log4j-api"  % "2.25.4",
+        "org.apache.logging.log4j" % "log4j-core" % "2.25.4",
 
         // Testing framework
         "org.scalatest" %% "scalatest" % "3.2.18" % Test,
