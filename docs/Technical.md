@@ -181,7 +181,9 @@ Trains one Ridge regression per metric on the historical DataFrame. Returns an `
 def fit(
   historicDf : DataFrame,
   valueCols  : Set[String],
-  config     : HSConfig = HSConfig()
+  config     : HSConfig = HSConfig(),
+  regularization : Double = 0.01,
+  elasticNet : Double = 0.0
 ): HSModel
 ```
 
@@ -190,6 +192,8 @@ def fit(
 | `historicDf` | `DataFrame` | ✅ | Historical data. Must contain a `timestamp` column and all columns listed in `valueCols` |
 | `valueCols` | `Set[String]` | ✅ | Names of the numeric metric columns to model (e.g. `Set("bookings", "searches")`) |
 | `config` | `HSConfig` | ❌ | Hyper-parameters — defaults to `HSConfig()` |
+| `regularization` | `Double` | ❌ | Regularization parameter for Ridge/Lasso regression (must be `>= 0`; default `0.01`). Higher values penalize large weights more aggressively, reducing overfitting on Fourier terms and shrinking unnecessary changepoints toward zero |
+| `elasticNet` | `Double` | ❌ | Elastic net mixing parameter (must be in `[0, 1]`; default `0.0`). `0.0` = pure L2 Ridge (default), `1.0` = pure L1 Lasso, values in between blend both penalties |
 
 **Supported `timestamp` column types:**
 
@@ -209,10 +213,12 @@ Convenience method — trains the model and immediately persists it to storage i
 
 ```scala
 def fitAndStore(
-  historicDf : DataFrame,
-  modelPath  : String,
-  valueCols  : Set[String],
-  config     : HSConfig = HSConfig()
+  historicDf     : DataFrame,
+  modelPath      : String,
+  valueCols      : Set[String],
+  config         : HSConfig = HSConfig(),
+  regularization : Double = 0.01,
+  elasticNet     : Double = 0.0
 )(implicit spark: SparkSession): HSModel
 ```
 
@@ -222,6 +228,8 @@ def fitAndStore(
 | `modelPath` | `String` | ✅ | Storage path for the model (e.g. `"s3://my-bucket/hs-model"`) |
 | `valueCols` | `Set[String]` | ✅ | Same as `fit()` |
 | `config` | `HSConfig` | ❌ | Same as `fit()` |
+| `regularization` | `Double` | ❌ | Same as `fit()` |
+| `elasticNet` | `Double` | ❌ | Same as `fit()` |
 
 **Returns:** `HSModel`
 
@@ -290,16 +298,24 @@ def predict(
 
 ---
 
-#### `HelterSkelter.loadAndPredict()`
+#### `HelterSkelter.predict()` — path overloads
 
-Convenience method — loads the model from storage and scores in one call. Prefer calling `HSModelStore.load()` once and reusing the `HSModel` when scoring multiple DataFrames.
+Convenience overloads — load the model from storage and score in one call. Prefer calling `HSModelStore.load()` once and reusing the `HSModel` when scoring multiple DataFrames.
 
 ```scala
-def loadAndPredict(
+// Uses the default z-score threshold (2.5)
+def predict(
+  modelPath : String,
+  df        : DataFrame,
+  valueCols : Set[String]
+)(implicit spark: SparkSession): DataFrame
+
+// Explicit threshold
+def predict(
   modelPath : String,
   df        : DataFrame,
   valueCols : Set[String],
-  threshold : Double = 2.5
+  threshold : Double
 )(implicit spark: SparkSession): DataFrame
 ```
 
@@ -308,7 +324,7 @@ def loadAndPredict(
 | `modelPath` | `String` | ✅ | Path where the model was previously saved |
 | `df` | `DataFrame` | ✅ | Same as `predict()` |
 | `valueCols` | `Set[String]` | ✅ | Same as `predict()` |
-| `threshold` | `Double` | ❌ | Same as `predict()` |
+| `threshold` | `Double` | ❌ | Same as `predict()` — only available in the second overload; omit to use the default `2.5` |
 
 ---
 

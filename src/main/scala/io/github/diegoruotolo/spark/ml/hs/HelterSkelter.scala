@@ -1,6 +1,6 @@
 package io.github.diegoruotolo.spark.ml.hs
 
-import HSModelStore.{load, store}
+import io.github.diegoruotolo.spark.ml.hs.HSModelStore.{load, store}
 import org.apache.log4j.{LogManager, Logger}
 import org.apache.spark.ml.Pipeline
 import org.apache.spark.ml.feature.VectorAssembler
@@ -55,7 +55,20 @@ object HelterSkelter {
   /** Default z-score threshold for anomaly classification (2.5 = 2.5 standard deviations from the norm) */
   val DEFAULT_Z_THRESHOLD = 2.5
 
-  // ─── PHASE 1: Batch training ──────────────────────────────────────────────────
+  /** Default regularization parameter for LinearRegression (0.01).
+   * Penalizes large weights → prevents overfitting on Fourier terms and shrinks unnecessary changepoints toward zero.
+   */
+  val DEFAULT_REGULARIZATION = 0.01
+
+  /** Default elastic net mixing parameter for LinearRegression (0.0 = pure L2 Ridge).
+   * 0.0 = pure L2 (Ridge), 1.0 = pure L1 (Lasso), values in between blend both.
+   * L2 is the recommended choice: MLlib solves pure Ridge via a closed-form normal equation,
+   * which is faster and numerically more stable than the iterative coordinate descent
+   * required when L1 is involved (elasticNet > 0).
+   */
+  val DEFAULT_ELASTIC_NET = 0.0
+
+  // ─── PHASE 1: Training ──────────────────────────────────────────────────
 
   /**
    * Trains the HelterSkelter model on historical data.
@@ -69,19 +82,34 @@ object HelterSkelter {
    *   - Fourier periods (24h, 168h, ...) are divided directly by ts_hours
    *     without additional conversions
    *
-   * @param historicDf DataFrame with historical data for training. Must have columns:
+   * @param historicDf     DataFrame with historical data for training. Must have columns:
    *                   - timestamp (TimestampType, DateType, StringType with format yyyy-MM-dd HH:mm:ss,
    *                     or LongType/IntegerType interpreted as Unix epoch seconds)
    *                   - one or more numeric metric columns whose names are listed in `valueCols`
-   * @param valueCols  set of column names in `historicDf` that contain the numeric metric values to model
-   *                   (e.g. Set("bookings", "searches")). Each gets its own LinearRegression stage.
-   * @param config     HSConfig with Fourier/changepoint hyper-parameters
+   * @param valueCols      set of column names in `historicDf` that contain the numeric metric values to model
+   *                       (e.g. Set("bookings", "searches")). Each gets its own LinearRegression stage.
+   * @param config         HSConfig with Fourier/changepoint hyper-parameters
+   * @param regularization regularization parameter for LinearRegression (must be >= 0; default 0.01)
+   * @param elasticNet     elastic net parameter for LinearRegression (must be in [0,1]; default 0.0)
+   *                       0.0 = pure L2 (Ridge, default), 1.0 = pure L1 (Lasso), 0.5 = equal mix of L1 and L2.
+   *                       L2 is the recommended choice: MLlib solves pure Ridge via a closed-form normal equation,
+   *                       which is faster and numerically more stable than the iterative coordinate descent
+   *                       required when L1 is involved (elasticNet > 0).
    * @return HSModel containing the trained PipelineModel and HSMeta with training parameters and sigmas for scoring
    */
-  def fit(historicDf: DataFrame, valueCols: Set[String], config: HSConfig = HSConfig()): HSModel = {
+  def fit(historicDf: DataFrame, valueCols: Set[String], config: HSConfig = HSConfig(), regularization: Double = DEFAULT_REGULARIZATION, elasticNet: Double = DEFAULT_ELASTIC_NET): HSModel = {
 
     logger.info("Starting training of HelterSkelter model")
     require(valueCols != null && valueCols.nonEmpty, "valueCols must not be empty")
+    val regParam = if (regularization >= 0) regularization else {
+      logger.warn(s"Invalid regularization parameter $regularization (must be >=0). Using default $DEFAULT_REGULARIZATION")
+      DEFAULT_REGULARIZATION
+    }
+    val elasticNetParam = if (elasticNet >= 0 && elasticNet <= 1) elasticNet else {
+      logger.warn(s"Invalid elasticNet parameter $elasticNet (must be in [0,1]). Using default $DEFAULT_ELASTIC_NET")
+      DEFAULT_ELASTIC_NET
+    }
+
     validateInput(historicDf, Set("timestamp") ++ valueCols, "train")
 
     // 1. Compute minTs and rangeTs in HOURS on the training set
@@ -151,8 +179,8 @@ object HelterSkelter {
         .setLabelCol(valueCol)
         .setPredictionCol(valueCol + "_prediction")
         .setMaxIter(200)
-        .setRegParam(0.01)
-        .setElasticNetParam(0.0) // 0.0 = pure L2 (Ridge), no L1
+        .setRegParam(regParam)
+        .setElasticNetParam(elasticNetParam)
       )
 
       // 6. Single Pipeline: assembler + all LR stages
@@ -205,18 +233,24 @@ object HelterSkelter {
   /**
    * Convenience method to train the model and store it in one step.
    *
-   * @param historicDf DataFrame with historical data for training. Must have columns:
+   * @param historicDf     DataFrame with historical data for training. Must have columns:
    *                   - timestamp (TimestampType, DateType, StringType with format yyyy-MM-dd HH:mm:ss,
    *                     or LongType/IntegerType interpreted as Unix epoch seconds)
    *                   - one or more numeric metric columns whose names are listed in `valueCols`
-   * @param modelPath  path where to save the model and metadata (e.g. "s3://my-bucket/spark-prophet")
-   * @param valueCols  set of column names in `historicDf` that contain the numeric metric values to model
-   * @param config     HSConfig with Fourier/changepoint hyper-parameters
-   * @param spark      implicit SparkSession
+   * @param modelPath      path where to save the model and metadata (e.g. "s3://my-bucket/spark-prophet")
+   * @param valueCols      set of column names in `historicDf` that contain the numeric metric values to model
+   * @param config         HSConfig with Fourier/changepoint hyper-parameters
+   * @param regularization regularization parameter for LinearRegression (must be >= 0; default 0.01)
+   * @param elasticNet     elastic net parameter for LinearRegression (must be in [0,1]; default 0.0)
+   *                       0.0 = pure L2 (Ridge, default), 1.0 = pure L1 (Lasso), 0.5 = equal mix of L1 and L2.
+   *                       L2 is the recommended choice: MLlib solves pure Ridge via a closed-form normal equation,
+   *                       which is faster and numerically more stable than the iterative coordinate descent
+   *                       required when L1 is involved (elasticNet > 0).
+   * @param spark          implicit SparkSession
    * @return HSModel containing the trained PipelineModel and HSMeta with training parameters and sigmas for scoring
    */
-  def fitAndStore(historicDf: DataFrame, modelPath: String, valueCols: Set[String], config: HSConfig = HSConfig())(implicit spark: SparkSession): HSModel = {
-    val model = fit(historicDf, valueCols, config)
+  def fitAndStore(historicDf: DataFrame, modelPath: String, valueCols: Set[String], config: HSConfig = HSConfig(), regularization: Double = DEFAULT_REGULARIZATION, elasticNet: Double = DEFAULT_ELASTIC_NET)(implicit spark: SparkSession): HSModel = {
+    val model = fit(historicDf, valueCols, config, regularization, elasticNet)
     store(model, modelPath)
     model
   }
@@ -300,6 +334,25 @@ object HelterSkelter {
 
   /**
    * Convenience method to load the model and score in one step.
+   * This method uses the default z-score threshold for anomaly classification.
+   *
+   * @param modelPath path where the model and metadata were saved during training (e.g. "s3://my-bucket/spark-prophet")
+   * @param df        DataFrame with new data to score. Must have columns:
+   *                       - timestamp (TimestampType, DateType, StringType with format yyyy-MM-dd HH:mm:ss,
+   *                         or LongType/IntegerType interpreted as Unix epoch seconds)
+   *                       - one or more numeric metric columns whose names are listed in `valueCols`
+   * @param valueCols set of metric column names to score (must be a subset of the columns the model was trained on)
+   * @return DataFrame with all original input columns preserved, plus the per-metric scoring columns described in predict().
+   * @see predict(HSModel, DataFrame, Set[String], Double)
+   * @see load(String)
+   * @note This method is less efficient if you need to score multiple DataFrames in a row, since it loads the model from storage every time.
+   *       In that case, it's better to call load() once and reuse the HSModel instance for multiple predict(HSModel, DataFrame, Set[String], Double) calls.
+   */
+  def predict(modelPath: String, df: DataFrame, valueCols: Set[String])(implicit spark: SparkSession): DataFrame =
+    predict(load(modelPath), df, valueCols)
+
+  /**
+   * Convenience method to load the model and score in one step.
    *
    * @param modelPath path where the model and metadata were saved during training (e.g. "s3://my-bucket/spark-prophet")
    * @param df        DataFrame with new data to score. Must have columns:
@@ -308,14 +361,13 @@ object HelterSkelter {
    *                       - one or more numeric metric columns whose names are listed in `valueCols`
    * @param valueCols set of metric column names to score (must be a subset of the columns the model was trained on)
    * @param threshold z-score threshold to classify anomalies (e.g. 2.5 means 2.5 standard deviations from the norm; must be > 0)
-   * @param spark     implicit SparkSession
-   * @return DataFrame with all original input columns preserved, plus the per-metric scoring columns described in scoreWithModel().
-   * @see scoreWithModel()
-   * @see loadModel()
+   * @return DataFrame with all original input columns preserved, plus the per-metric scoring columns described in predict().
+   * @see predict(HSModel, DataFrame, Set[String], Double)
+   * @see load(String)
    * @note This method is less efficient if you need to score multiple DataFrames in a row, since it loads the model from storage every time.
-   *       In that case, it's better to call loadModel() once and reuse the HSModel instance for multiple scoreWithModel() calls.
+   *       In that case, it's better to call load() once and reuse the HSModel instance for multiple predict(HSModel, DataFrame, Set[String], Double) calls.
    */
-  def loadAndPredict(modelPath: String, df: DataFrame, valueCols: Set[String], threshold: Double = DEFAULT_Z_THRESHOLD)(implicit spark: SparkSession): DataFrame =
+  def predict(modelPath: String, df: DataFrame, valueCols: Set[String], threshold: Double)(implicit spark: SparkSession): DataFrame =
     predict(load(modelPath), df, valueCols, threshold)
 
   // ─── Feature engineering ──────────────────────────────────────────────────────

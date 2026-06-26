@@ -8,7 +8,7 @@ Helter Skelter models a time series as a fully **additive decomposition** of:
 - Multiple seasonal components
 - Noise
 
-$y(t) = g(t) + s(t) + penalty$
+$y(t) = g(t) + s(t)$
 
 ---
 
@@ -93,7 +93,7 @@ Helter Skelter natively supports **four layers of periodicity**:
 The complete model becomes:
 
 $
-y(t) = k \cdot t + \sum_{i=1}^{N} \delta_i \cdot \max(0, t - s_i) + \sum_{\text{seasonalities}} s_j(t) + penalty$
+y(t) = k \cdot t + \sum_{i=1}^{N} \delta_i \cdot \max(0, t - s_i) + \sum_{\text{seasonalities}} s_j(t)$
 ---
 
 ## Feature Vector Construction
@@ -141,7 +141,7 @@ Where:
 
 ## Regularization — Ridge (L2)
 
-Helter Skelter uses **Ridge regression (L2)**.
+Helter Skelter uses by default **Ridge regression (L2)**.
 
 For each metric m, the optimization problem is:
 
@@ -149,7 +149,7 @@ $\min_{w}\left(\|y - Xw\|^2 + \lambda \|w\|^2\right)$
 
 Where:
 
-- $\lambda = 0.01$
+- $\lambda = 0.01$ (default)
 
 ---
 

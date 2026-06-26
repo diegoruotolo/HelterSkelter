@@ -18,7 +18,7 @@ class HelterSkelterSuite extends AnyFunSuite with Matchers with DataFrameSuiteBa
 
   // ─── Helpers ────────────────────────────────────────────────────────────────
   private def doPredict(df: DataFrame = buildDfToPredict(), valueCols: Set[String] = testMetrics, sigmaThreshold: Double = DEFAULT_Z_THRESHOLD): DataFrame =
-    HelterSkelter.loadAndPredict(testModelPath, df, valueCols, sigmaThreshold)
+    HelterSkelter.predict(testModelPath, df, valueCols, sigmaThreshold)
 
   // ─── fit() ──────────────────────────────────────────────────────────────────
 
@@ -242,7 +242,7 @@ class HelterSkelterSuite extends AnyFunSuite with Matchers with DataFrameSuiteBa
 
     val dfToPredict = buildDfToPredict()
     val resultWithModel = HelterSkelter.predict(loadTestModel(), dfToPredict, testMetrics)
-    val resultWithPath = HelterSkelter.loadAndPredict(testModelPath, dfToPredict, testMetrics)
+    val resultWithPath = HelterSkelter.predict(testModelPath, dfToPredict, testMetrics)
 
     // Same columns
     resultWithModel.columns.sorted should be(resultWithPath.columns.sorted)
